@@ -1,5 +1,6 @@
 // Copyright 2018 the Deno authors. All rights reserved. MIT license.
 use fs;
+use net;
 use sha1;
 use std;
 use std::error::Error;
@@ -25,12 +26,17 @@ pub struct DenoDir {
   // This is where we cache compilation outputs. Example:
   // /Users/rld/.deno/gen/f39a473452321cacd7c346a870efb0e3e1264b43.js
   pub deps: PathBuf,
+  // If remote resources should be reloaded.
+  reload: bool,
 }
 
 impl DenoDir {
   // Must be called before using any function from this module.
   // https://github.com/denoland/deno/blob/golang/deno_dir.go#L99-L111
-  pub fn new(custom_root: Option<&Path>) -> std::io::Result<DenoDir> {
+  pub fn new(
+    reload: bool,
+    custom_root: Option<&Path>,
+  ) -> std::io::Result<DenoDir> {
     // Only setup once.
     let home_dir = std::env::home_dir().expect("Could not get home directory.");
     let default = home_dir.join(".deno");
@@ -42,7 +48,12 @@ impl DenoDir {
     let gen = root.as_path().join("gen");
     let deps = root.as_path().join("deps");
 
-    let deno_dir = DenoDir { root, gen, deps };
+    let deno_dir = DenoDir {
+      root,
+      gen,
+      deps,
+      reload,
+    };
     fs::mkdir(deno_dir.gen.as_ref())?;
     fs::mkdir(deno_dir.deps.as_ref())?;
 
@@ -93,6 +104,43 @@ impl DenoDir {
     }
   }
 
+  // Prototype https://github.com/denoland/deno/blob/golang/deno_dir.go#L37-L73
+  fn fetch_remote_source(
+    self: &DenoDir,
+    module_name: &str,
+    filename: &str,
+  ) -> std::io::Result<String> {
+    let filepath = Path::new(filename);
+    if !self.reload && filepath.exists() {
+      fs::read_file_sync_string(&filepath)
+    } else {
+      println!("Downloading {}", module_name);
+      net::http_code_fetch(module_name).and_then(|res| {
+        fs::write_file_sync(&filepath, res.as_bytes());
+        Ok(res)
+      })
+    }
+  }
+
+  // Prototype: https://github.com/denoland/deno/blob/golang/os.go#L122-L138
+  fn get_source_code(
+    self: &DenoDir,
+    module_name: &str,
+    filename: &str,
+  ) -> std::io::Result<String> {
+    if is_remote(module_name) {
+      self.fetch_remote_source(module_name, filename)
+    } else if module_name.starts_with(ASSET_PREFIX) {
+      panic!("Asset resolution should be done in JS, not Rust.");
+    } else {
+      assert!(
+        module_name == filename,
+        "if a module isn't remote, it should have the same filename"
+      );
+      fs::read_file_sync_string(Path::new(filename))
+    }
+  }
+
   pub fn code_fetch(
     self: &DenoDir,
     module_specifier: &str,
@@ -106,7 +154,8 @@ impl DenoDir {
             module_name, module_specifier, containing_file, filename
         );
 
-    let out = get_source_code(module_name.as_str(), filename.as_str())
+    let out = self
+      .get_source_code(module_name.as_str(), filename.as_str())
       .and_then(|source_code| {
         Ok(CodeFetchOutput {
           module_name,
@@ -154,6 +203,9 @@ impl DenoDir {
     module_specifier: &str,
     containing_file: &str,
   ) -> Result<(String, String), url::ParseError> {
+    let module_name;
+    let filename;
+
     debug!(
       "resolve_module before module_specifier {} containing_file {}",
       module_specifier, containing_file
@@ -165,12 +217,11 @@ impl DenoDir {
 
     let j: Url =
       if containing_file == "." || Path::new(module_specifier).is_absolute() {
-        let r = Url::from_file_path(module_specifier);
-        // TODO(ry) Properly handle error.
-        if r.is_err() {
-          error!("Url::from_file_path error {}", module_specifier);
+        if module_specifier.starts_with("http://") {
+          Url::parse(module_specifier)?
+        } else {
+          Url::from_file_path(module_specifier).unwrap()
         }
-        r.unwrap()
       } else if containing_file.ends_with("/") {
         let r = Url::from_directory_path(&containing_file);
         // TODO(ry) Properly handle error.
@@ -189,25 +240,53 @@ impl DenoDir {
         base.join(module_specifier)?
       };
 
-    let mut p = j
-      .to_file_path()
-      .unwrap()
-      .into_os_string()
-      .into_string()
-      .unwrap();
+    match j.scheme() {
+      "file" => {
+        let mut p = j
+          .to_file_path()
+          .unwrap()
+          .into_os_string()
+          .into_string()
+          .unwrap();
 
-    if cfg!(target_os = "windows") {
-      // On windows, replace backward slashes to forward slashes.
-      // TODO(piscisaureus): This may not me be right, I just did it to make
-      // the tests pass.
-      p = p.replace("\\", "/");
+        if cfg!(target_os = "windows") {
+          // On windows, replace backward slashes to forward slashes.
+          // TODO(piscisaureus): This may not me be right, I just did it to make
+          // the tests pass.
+          p = p.replace("\\", "/");
+        }
+
+        module_name = p.to_string();
+        filename = p.to_string();
+      }
+      _ => {
+        module_name = module_specifier.to_string();
+        filename = get_cache_filename(self.deps.clone(), j);
+      }
     }
 
-    let module_name = p.to_string();
-    let filename = p.to_string();
-
+    debug!("module_name: {}, filename: {}", module_name, filename);
     Ok((module_name, filename))
   }
+}
+
+fn get_cache_filename(basedir: PathBuf, url: Url) -> String {
+  let mut pathbuf: PathBuf = basedir.clone();
+
+  pathbuf.push(url.host_str().unwrap());
+  for path_seg in url.path_segments().unwrap() {
+    pathbuf.push(path_seg);
+  }
+
+  pathbuf.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn test_get_cache_filename() {
+  let url = Url::parse("http://example.com:1234/path/to/file.ts").unwrap();
+  let basedir = Path::new("/cache/dir/").to_path_buf();
+  let cache_file = get_cache_filename(basedir, url);
+  assert_eq!(cache_file, "/cache/dir/example.com/path/to/file.ts");
 }
 
 #[derive(Debug)]
@@ -221,7 +300,8 @@ pub struct CodeFetchOutput {
 #[cfg(test)]
 pub fn test_setup() -> (TempDir, DenoDir) {
   let temp_dir = TempDir::new().expect("tempdir fail");
-  let deno_dir = DenoDir::new(Some(temp_dir.path())).expect("setup fail");
+  let deno_dir =
+    DenoDir::new(false, Some(temp_dir.path())).expect("setup fail");
   (temp_dir, deno_dir)
 }
 
@@ -395,24 +475,6 @@ fn test_resolve_module() {
 
 const ASSET_PREFIX: &str = "/$asset$/";
 
-fn is_remote(_module_name: &str) -> bool {
-  false
-}
-
-fn get_source_code(
-  module_name: &str,
-  filename: &str,
-) -> std::io::Result<String> {
-  if is_remote(module_name) {
-    unimplemented!();
-  } else if module_name.starts_with(ASSET_PREFIX) {
-    assert!(false, "Asset resolution should be done in JS, not Rust.");
-    unimplemented!();
-  } else {
-    assert!(
-      module_name == filename,
-      "if a module isn't remote, it should have the same filename"
-    );
-    fs::read_file_sync_string(Path::new(filename))
-  }
+fn is_remote(module_name: &str) -> bool {
+  module_name.starts_with("http")
 }

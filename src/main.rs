@@ -16,6 +16,7 @@ mod deno_dir;
 mod flags;
 mod fs;
 pub mod handlers;
+mod net;
 mod version;
 
 use libc::c_void;
@@ -47,7 +48,7 @@ impl Deno {
 
     let mut deno_box = Box::new(Deno {
       ptr: 0 as *const binding::DenoC,
-      dir: deno_dir::DenoDir::new(None).unwrap(),
+      dir: deno_dir::DenoDir::new(flags.reload, None).unwrap(),
       rt: tokio::runtime::current_thread::Runtime::new().unwrap(),
       timers: HashMap::new(),
       argv: argv_rest,
