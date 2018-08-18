@@ -3,6 +3,7 @@ language: c++
 branches:
   only:
   - master
+  - release2
 
 env:
   global:
@@ -40,8 +41,8 @@ before_script:
   - ./tools/setup.py
 script:
   - ./tools/lint.py
-  - ./tools/build.py -j2
-  - ./tools/test.py $DENO_BUILD_PATH
+  #- ./tools/build.py -j2
+  #- ./tools/test.py $DENO_BUILD_PATH
 
 jobs:
   include:
@@ -54,7 +55,7 @@ jobs:
           DENO_BUILD_MODE=release \
           ./tools/build.py -j2
         # test release binary
-        env DENO_BUILD_MODE=release ./tools/test.py
+        #env DENO_BUILD_MODE=release ./tools/test.py
       before_deploy: |
         # gzip and name release to denote platform
         gzip -c $DENO_BUILD_PATH/deno > $DENO_BUILD_PATH/deno_linux_x64.gz
@@ -66,3 +67,4 @@ jobs:
         file: "$DENO_BUILD_PATH/deno_linux_x64.gz"
         on:
           repo: denoland/deno
+          branch: release2
